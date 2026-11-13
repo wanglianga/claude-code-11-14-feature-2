@@ -1,0 +1,23 @@
+package com.example.flightops.repo;
+
+import com.example.flightops.domain.DailyReport;
+import com.example.flightops.domain.DailyReportId;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+
+public interface DailyReportRepository extends JpaRepository<DailyReport, DailyReportId> {
+
+    List<DailyReport> findByReportDateOrderByVersionAsc(LocalDate reportDate);
+
+    Optional<DailyReport> findByReportDateAndVersion(LocalDate reportDate, int version);
+
+    Optional<DailyReport> findTopByReportDateOrderByVersionDesc(LocalDate reportDate);
+
+    /** 分区表复合主键：id 由序列显式赋值。 */
+    @Query(value = "SELECT nextval('daily_report_id_seq')", nativeQuery = true)
+    Long nextId();
+}

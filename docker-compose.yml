@@ -1,0 +1,34 @@
+# 一键启动：docker compose up --build
+# 应用 http://localhost:8080 ，Swagger UI http://localhost:8080/swagger-ui.html
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: flightops
+      POSTGRES_USER: flight
+      POSTGRES_PASSWORD: flight
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flight -d flightops"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+
+  app:
+    build: .
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/flightops
+      DB_USER: flight
+      DB_PASSWORD: flight
+      SERVER_PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
