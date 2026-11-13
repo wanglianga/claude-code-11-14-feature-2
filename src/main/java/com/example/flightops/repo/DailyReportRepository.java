@@ -17,6 +17,9 @@ public interface DailyReportRepository extends JpaRepository<DailyReport, DailyR
 
     Optional<DailyReport> findTopByReportDateOrderByVersionDesc(LocalDate reportDate);
 
+    /** 切换评审撞锁检查：该日期是否存在锁定日报（锁定优先，切换顺延）。 */
+    List<DailyReport> findByReportDateAndStatus(LocalDate reportDate, String status);
+
     /** 分区表复合主键：id 由序列显式赋值。 */
     @Query(value = "SELECT nextval('daily_report_id_seq')", nativeQuery = true)
     Long nextId();

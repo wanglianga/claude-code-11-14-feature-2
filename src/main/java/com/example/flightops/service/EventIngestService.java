@@ -37,6 +37,7 @@ public class EventIngestService {
     private final ReleaseJudge releaseJudge;
     private final ReplayService replayService;
     private final AppProperties properties;
+    private final CaliberComputeEngine caliberComputeEngine;
 
     public EventIngestService(FlightInstanceRepository instanceRepository,
                               ChangeLogRepository changeLogRepository,
@@ -44,7 +45,8 @@ public class EventIngestService {
                               StateMachine stateMachine,
                               ReleaseJudge releaseJudge,
                               ReplayService replayService,
-                              AppProperties properties) {
+                              AppProperties properties,
+                              CaliberComputeEngine caliberComputeEngine) {
         this.instanceRepository = instanceRepository;
         this.changeLogRepository = changeLogRepository;
         this.alertService = alertService;
@@ -52,6 +54,7 @@ public class EventIngestService {
         this.releaseJudge = releaseJudge;
         this.replayService = replayService;
         this.properties = properties;
+        this.caliberComputeEngine = caliberComputeEngine;
     }
 
     @Transactional
@@ -134,6 +137,11 @@ public class EventIngestService {
         }
         instance.setUpdatedAt(now);
         instanceRepository.save(instance);
+
+        // 多口径并行补偿：窗口内更新与超窗补录都必须向所有并行口径逐口径留痕，禁止只补主口径
+        caliberComputeEngine.compensate(id,
+                entries.stream().map(e -> e.getId().getChangeVersion()).toList(),
+                late, source, note);
 
         return new IngestResult(id.toString(), eventType.name(),
                 entries.stream().map(e -> e.getId().getChangeVersion()).toList(),

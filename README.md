@@ -73,6 +73,46 @@ LANDED → （终态）
 实时口径分母 = 已判定（已起飞）班次；日报口径分母 = 已起飞 + 应飞未飞（记不正常）。
 两者分列展示，差异可由变更日志逐航班解释——这就是 87.4 与 85.1 的可对账版本。
 
+### 1.8 多口径并行计算与发布仲裁（V2 子系统）
+机场看放行是否准点、航司看起飞/到达是否准点、集团报送还有第三套分母规则；两侧时间戳来源不同，
+**同一航班机场判正常、航司判延误是常态**，差额往往出在推出与起飞之间的等待。子系统由四块组成：
+
+**(1) 口径注册库 `caliber_definition`（版本化）**：每套口径保存时间戳来源、分母规则、容差与生效版本。
+种子内置三套并行口径：
+
+| code | 视角 | 时间戳来源 | 分母规则 | 容差 |
+| --- | --- | --- | --- | --- |
+| AIRPORT | 机场放行 | PUSHBACK 推出 | FLOWN_PLUS_MISSING（已飞+应飞未飞，取消不计） | 20 分钟 |
+| AIRLINE | 航司起降 | DEPARTURE 起飞 | FLOWN_ONLY（仅已起飞） | 15 分钟 |
+| GROUP | 集团报送 | ARRIVAL 到达 | ALL_REGISTERED（全部登记实例，取消/未飞均计不正常） | 15 分钟 |
+
+事后改口径只生成新版本（同 code 下 version 递增，旧版 RETIRED 保留），不回写任何历史结果。
+
+**(2) 并行计算引擎**：同一批 `flight_change_log` 事件按每个生效口径各跑一份物化结果
+（`caliber_run` + `caliber_result_item`），运行行内**快照口径定义并绑定口径版本号**——
+口径定义与结果双版本绑定。选型取舍：不做"一份明细、查询时按口径现算"（口径一改历史报表就变、
+报送数字无法复现），宁可存储与计算翻倍；迟到事件向多套结果同时补偿。
+- 事件摄入自动联动：窗口内更新/超窗补录事件对**所有**生效口径逐口径补偿，
+  每口径一条 `caliber_compensation` 留痕（含触发变更版本号、from/to 运行、late/source），
+  只补主口径会造成的分区静默分叉由 `GET .../fork-audit` 审计。
+- 补偿只产 COMPUTED 候选运行，旧 PUBLISHED 运行保持权威直到仲裁通过。
+
+**(3) 发布仲裁 `caliber_release_diff` / `caliber_switch_review` / `caliber_switch_conflict`**：
+- 发布前逐航班比对候选运行与当期已发布运行的 counted/normal/delay_minutes；
+  每条差额必须归因——同口径版本下归因到两版之间的具体状态变更版本号（EXPLAINED），
+  口径改版造成的差额归因到 `CALIBER_DEF_Vx->Vy`；**无法解释的差额拦截发布**，
+  候选运行置 BLOCKED，拦截留痕在独立事务提交（不随异常回滚），旧发布结果仍是权威。
+- 主口径切换必须走评审；评审撞上当日日报锁定时**锁定优先**，评审置 CONFLICT_DEFERRED、
+  顺延到下一发布周期并写冲突记录，顺延到期无锁后才 APPLIED。
+
+**(4) 下游绑定台账 `downstream_binding`**：大屏、月报、对外报送各引用哪一版，
+同时绑定口径定义版本与具体物化运行（月报/报送必须绑 runId，大屏可只绑口径版本）；
+同周期重绑旧行置 inactive 保留历史，已锁定月报按当时绑定版本永久复现。
+
+**历史补齐 `caliber_backfill_segment`**：按新口径补齐历史时，补齐运行与明细一律标 BACKFILL，
+与原始 ORIGINAL 区间分列；区间台账记录哪版口径、哪个区间、因何补齐，
+配合明细 `backfill_scope` 可逐条查到受影响航班——哪版口径、何时切换、影响哪些航班都可追溯。
+
 ---
 
 ## 2. 快速开始
@@ -111,13 +151,16 @@ Swagger UI（`/swagger-ui.html`）与 OpenAPI 文档（`/v3/api-docs`）开放�
 
 ## 3. 验证方式
 
-### 3.1 自动化测试（18 个用例）
+### 3.1 自动化测试（29 个用例）
 ```bash
 /opt/maven/bin/mvn test
 ```
 覆盖：状态机合法/非法路径（含取消后恢复、起飞后备降、备降后取消、未推出直接落地）、
 正负号变更日志、判定绑定计划版本（改计划不回写）、迟到/补录标记、时间更正重判、
-日报口径与实时口径、同一批事件重算结果一致、锁定后更正版本、差异定位到具体变更。
+日报口径与实时口径、同一批事件重算结果一致、锁定后更正版本、差异定位到具体变更；
+多口径子系统 11 个用例：三套口径并行物化、机场正常/航司延误跨口径对比、
+超窗补录逐口径补偿与分叉审计、发布差额归因与不可解释拦截、切换评审撞锁定顺延、
+口径改版双版本绑定历史复现、下游绑定台账、历史补齐区间分列。
 
 ### 3.2 端到端脚本（48 项断言）
 服务启动后执行：
@@ -133,7 +176,20 @@ PGUSER=flight PGPASSWORD=flight PGDATABASE=flightops ./scripts/verify.sh
 更正版 v2（75%）→ 差异定位到具体变更 → 更正记录（原值/更正值/原因）→ 鉴权与文档检查。
 脚本默认先用 psql 清空业务表保证可重复执行（`CLEAN_DB=0` 可关闭，聚合断言将跳过）。
 
-### 3.3 手工验证示例（curl）
+### 3.3 多口径子系统端到端脚本（58 项断言）
+服务启动后执行：
+```bash
+./scripts/verify-multi-caliber.sh
+# Compose 环境：PGUSER=flight PGPASSWORD=flight PGDATABASE=flightops ./scripts/verify-multi-caliber.sh
+```
+完整走一遍多口径故事线：构造"推出 +10 分钟（机场正常）/ 起飞 +40 分钟（航司延误）/ 到达准点（集团正常）"
+→ 同一批事件并行产出三套带版本物化结果 → 跨口径逐航班对比 → 三套运行首次发布 →
+超窗补录事件向全部口径逐口径补偿（9 条留痕、分叉审计为空）→ 补偿运行发布且差额归因到具体变更版本 →
+SQL 模拟无变更支撑的差额被 409 拦截且运行置 BLOCKED → 切换评审（无锁生效/撞日报锁定顺延留冲突/驳回不改主口径）
+→ 口径改版生成 v2 且历史运行仍按 v1 复现 → 下游绑定台账（月报必须绑运行、大屏可只绑口径）→
+历史补齐区间与原始区间分列 → 鉴权检查。脚本同样先清运行期表、复位种子口径，可重复执行。
+
+### 3.4 手工验证示例（curl）
 ```bash
 # 登记实例（首版计划）
 curl -u manager:manager123 -X POST localhost:8080/api/instances -H 'Content-Type: application/json' -d '{
@@ -159,10 +215,13 @@ curl -u viewer:viewer123 'localhost:8080/api/alerts?date=2026-11-13'
 curl -u viewer:viewer123 'localhost:8080/api/caliber'
 ```
 
-### 3.4 本题实际执行过的验证
-- `mvn test`：18/18 通过（StateMachineTest 5、EventIngestServiceTest 8、ReportServiceTest 5）。
+### 3.5 本题实际执行过的验证
+- `mvn test`：29/29 通过（StateMachineTest 5、EventIngestServiceTest 8、ReportServiceTest 5、
+  CaliberSubsystemTest 4、CaliberArbitrationTest 7）。
 - `./scripts/verify.sh`：48/48 断言通过（本机 `java -jar` + 容器 PostgreSQL 18 实跑）。
-- Docker/Compose 配置经静态核查（本容器无 docker 守护进程，未实际构建镜像）。
+- `./scripts/verify-multi-caliber.sh`：58/58 断言通过（同一环境实跑，覆盖多口径四块子系统）。
+- Docker/Compose 配置经静态核查（本容器无 docker 守护进程，未实际构建镜像；构建沿用既有
+  多阶段 Dockerfile，新增代码与 V2 迁移均在 COPY 范围内，启动时 Flyway 自动建表）。
 
 ---
 
@@ -184,7 +243,26 @@ curl -u viewer:viewer123 'localhost:8080/api/caliber'
 | GET | `/api/reports/{date}/diff?from=&to=` | 版本间差异（定位到具体变更） |
 | GET | `/api/reports/{date}/corrections` | 更正记录（原值/更正值/原因） |
 | GET | `/api/alerts?date=` | 告警查询；`PUT /api/alerts/{id}/acknowledge` 确认 |
-| GET | `/api/caliber` | 固化统计口径 |
+| GET | `/api/caliber` | 固化统计口径（原始单口径说明） |
+| GET / POST | `/api/calibers` | 口径注册库：查全部定义 / 注册新口径首版 |
+| GET | `/api/calibers/main` | 当前主口径（最近 APPLIED 评审指向的版本） |
+| GET | `/api/calibers/{code}` / `.../versions/{v}` | 口径版本列表 / 指定版本（历史复现） |
+| POST | `/api/calibers/{code}/versions` | 口径改版（生成新版本、退役旧版，历史不回写） |
+| POST | `/api/caliber-runs/compute/{date}` | 并行计算：全部生效口径各产一份物化运行 |
+| GET | `/api/caliber-runs/{date}` | 当天各口径全部物化运行 |
+| GET | `/api/caliber-runs/{date}/runs/{runId}` | 运行明细（逐航班结论与口径事实时间） |
+| GET | `/api/caliber-runs/{date}/flights/{f}/legs/{l}/compare` | 同航班跨口径对比 |
+| GET | `/api/caliber-runs/{date}/compensations` | 逐口径补偿留痕（另有单航班路径与 `/fork-audit`） |
+| POST | `/api/caliber-runs/backfill` | 历史区间补齐（BACKFILL 与 ORIGINAL 分列） |
+| GET | `/api/caliber-runs/backfill/segments` | 补齐区间标注台账 |
+| POST | `/api/caliber-releases/{date}/runs/{runId}/publish` | 发布仲裁（不可解释差额 409 拦截） |
+| GET | `/api/caliber-releases/{date}/runs/{runId}/diffs` | 发布差额与归因明细 |
+| POST | `/api/caliber-releases/switch-reviews` | 发起主口径切换评审 |
+| POST | `/api/caliber-releases/switch-reviews/{id}/decision` | 评审决定（撞锁定自动顺延留冲突） |
+| POST | `/api/caliber-releases/switch-reviews/{id}/resolve` | 顺延到期落地切换 |
+| GET | `/api/caliber-releases/switch-reviews` `/switch-conflicts` | 评审列表 / 冲突记录 |
+| POST | `/api/downstream-bindings` | 下游绑定（大屏/月报/对外报送） |
+| GET | `/api/downstream-bindings/active`、`/{target}`、`/by-caliber` | 生效绑定 / 历史 / 按口径版本反查影响面 |
 
 ## 5. 配置项（`application.yml`，均可环境变量覆盖）
 
@@ -208,5 +286,16 @@ curl -u viewer:viewer123 'localhost:8080/api/caliber'
 | `report_correction` | `report_date` 按月 | 更正记录（原值/更正值/原因） |
 | `report_diff` | `report_date` 按月 | 版本间差异（定位到具体变更版本） |
 | `alert` | — | 非法流转等告警 |
+| `caliber_definition` | — | 口径注册库（时间戳来源/分母规则/容差，版本化） |
+| `caliber_run` | `service_date` 按月 | 口径物化运行（快照口径定义+双版本绑定） |
+| `caliber_result_item` | `service_date` 按月 | 口径结果明细（逐航班，含事实时间与补齐标注） |
+| `caliber_compensation` | `service_date` 按月 | 逐口径补偿留痕（窗口更新/超窗补录） |
+| `caliber_release_diff` | `service_date` 按月 | 发布前逐航班差额与归因（EXPLAINED/UNEXPLAINED） |
+| `caliber_switch_review` | — | 主口径切换评审（含顺延生效日期） |
+| `caliber_switch_conflict` | — | 切换撞日报锁定的冲突与顺延记录 |
+| `downstream_binding` | — | 下游绑定台账（大屏/月报/对外报送） |
+| `caliber_backfill_segment` | — | 历史补齐区间标注（ORIGINAL/BACKFILL 分列） |
 
-分区由 Flyway `V1__init.sql` 预建（2026-01 ~ 2027-12 按月 + DEFAULT），超范围数据落 DEFAULT 分区。
+分区由 Flyway `V1__init.sql` 与 `V2__multi_caliber_arbitration.sql` 预建
+（2026-01 ~ 2027-12 按月 + DEFAULT），超范围数据落 DEFAULT 分区。
+V2 同时写入三套种子口径与一条基线主口径（AIRPORT v1）切换记录。
